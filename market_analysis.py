@@ -10,22 +10,20 @@ import argparse
 import argcomplete
 import math
 import sys
-
 import httpx
 import requests
 from pprint import pprint
 import logging
 from tabulate import tabulate
 import time
-from datetime import date, datetime
+import datetime
 from MaxHeap import MaxHeap
 import pandas as pd
 from deprecated import deprecated
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 import asyncio
 from aiohttp import ClientSession
 import httpcore
+import json
 
 class MarketAnalysis():
     def __init__(self):
@@ -40,6 +38,8 @@ class MarketAnalysis():
         self.MARGIN_URL = "https://zerodha.com/margin-calculator/SPAN"
         self.SGB_URL = "https://www1.nseindia.com/live_market/dynaContent/live_watch/stock_watch/sovGoldStockWatch.json"
         self.SGB_BOND_URL = "https://www.nseindia.com/api/quote-equity"
+        self.HISTORICAL_DATA_URL = "https://www.nseindia.com/api/historical/indicesHistory"
+        self.INDICES_URL = "https://www.nseindia.com/api/equity-master"
         self.MARGIN = {
             'STRANGLE': 100000,
             'BULLCALLSPREAD': 22000
@@ -63,9 +63,35 @@ class MarketAnalysis():
         self.near_expiry_date = None
         self.far_expiry_date = None
         self.market_depth = 5
+        self.nse_session = None
+        self.historical_data = None
+        self.nse_client_session = None
         self.desc = "Algorithmic trading"
-        parser = argparse.ArgumentParser(description=self.desc)
-        parser.add_argument('command', help="command to execute a function like <oi> , <returns>, <expirydates>")
+        parser = argparse.ArgumentParser(description=self.desc, formatter_class=argparse.RawTextHelpFormatter)
+        parser.add_argument('command', help="""command to execute a function like <oi> , <returns>, <expirydates> , <hr>
+
+For hr command, the following indices are supported:
++----------------------------+--------------------------------+---------------------------+---------------------------------+--------------------+
+|    Broad Market Indices    |        Sectoral Indices        |     Thematic Indices      |        Strategy Indices         |       Others       |
++----------------------------+--------------------------------+---------------------------+---------------------------------+--------------------+
+|          NIFTY 50          |           NIFTY AUTO           |     NIFTY COMMODITIES     | NIFTY DIVIDEND OPPORTUNITIES 50 | Securities in F&O  |
+|       NIFTY NEXT 50        |           NIFTY BANK           |  NIFTY INDIA CONSUMPTION  |        NIFTY50 VALUE 20         | Permitted to Trade |
+|      NIFTY MIDCAP 50       |          NIFTY ENERGY          |        NIFTY CPSE         |       NIFTY100 QUALITY 30       |                    |
+|      NIFTY MIDCAP 100      |    NIFTY FINANCIAL SERVICES    |   NIFTY INFRASTRUCTURE    |      NIFTY50 EQUAL WEIGHT       |                    |
+|      NIFTY MIDCAP 150      | NIFTY FINANCIAL SERVICES 25/50 |         NIFTY MNC         |      NIFTY100 EQUAL WEIGHT      |                    |
+|     NIFTY SMALLCAP 50      |           NIFTY FMCG           |  NIFTY GROWTH SECTORS 15  |   NIFTY100 LOW VOLATILITY 30    |                    |
+|     NIFTY SMALLCAP 100     |            NIFTY IT            |         NIFTY PSE         |         NIFTY ALPHA 50          |                    |
+|     NIFTY SMALLCAP 250     |          NIFTY MEDIA           |   NIFTY SERVICES SECTOR   |       NIFTY200 QUALITY 30       |                    |
+|   NIFTY MIDSMALLCAP 400    |          NIFTY METAL           |    NIFTY100 LIQUID 15     |  NIFTY ALPHA LOW-VOLATILITY 30  |                    |
+|         NIFTY 100          |          NIFTY PHARMA          |  NIFTY MIDCAP LIQUID 15   |      NIFTY200 MOMENTUM 30       |                    |
+|         NIFTY 200          |         NIFTY PSU BANK         |    NIFTY INDIA DIGITAL    |   NIFTY MIDCAP150 QUALITY 50    |                    |
+| NIFTY500 MULTICAP 50:25:25 |          NIFTY REALTY          |       NIFTY100 ESG        |                                 |                    |
+|   NIFTY LARGEMIDCAP 250    |       NIFTY PRIVATE BANK       | NIFTY INDIA MANUFACTURING |                                 |                    |
+|    NIFTY MIDCAP SELECT     |     NIFTY HEALTHCARE INDEX     |                           |                                 |                    |
+|     NIFTY TOTAL MARKET     |    NIFTY CONSUMER DURABLES     |                           |                                 |                    |
+|     NIFTY MICROCAP 250     |        NIFTY OIL & GAS         |                           |                                 |                    |
++----------------------------+--------------------------------+---------------------------+---------------------------------+--------------------+
+                            """)
         parser.add_argument('-l', '--log-level',
                             choices=['DEBUG', 'INFO', 'WARNING'], default=logging.INFO,
                             help="Set the log level for standalone logging")
@@ -104,6 +130,28 @@ class MarketAnalysis():
 
         getattr(self, args.command)()
 
+    def initiate_nse_session(self):
+        self.nse_session = requests.Session()
+        self.nse_session.get(self.COOKIE_URL, headers=self.headers)
+        
+    def indices(self):
+        self.get_indices()
+    
+    def get_indices(self):
+        data = self.requester(self.INDICES_URL)
+        headers = [key for key in data.keys()]
+        max_len = max([len(data[key]) for key in data.keys()])
+        indices = [[] for i in range(max_len)]
+        for idx in range(max_len):
+            for key in data.keys():
+                if idx < len(data[key]):
+                    indices[idx].append(data[key][idx])
+                else:
+                    indices[idx].append("")
+        print(tabulate(indices, headers=headers, tablefmt='pretty', showindex=False))
+        #print(json.dumps(data, indent=4))
+        
+       
     def oi(self):
         """
           Analyse Open Interest
@@ -203,6 +251,98 @@ class MarketAnalysis():
     def expirydates(self):
         self.get_expiry_data()
 
+    def hr(self):
+        """
+        :returns
+        """
+        # Argument parser for historical returns
+        parser = argparse.ArgumentParser(description='Argument parser for hisrotical returns command')
+        parser.add_argument('-i', '--index_type', default=None,
+                            help="index type for historical data. For example NIFTY MIDCAP 150, NIFTY SMALLCAP 250")
+        parser.add_argument('-r', '--frequency', default="Yearly", type=str, choices=["Monthly", "Yearly"],
+                            help="Frequency for historical data. For example Monthly, Yearly")
+        parser.add_argument('-t', '--to_date', default=None, type=lambda s: datetime.datetime.strptime(s, '%d-%m-%Y'),
+                            help="to date for historical data. Format dd-mm-yyyy (example 31-01-2022")
+        parser.add_argument('-f', '--from_date', default=None, type=lambda s: datetime.datetime.strptime(s, '%d-%m-%Y'),
+                            help="to date for historical data. Format dd-mm-yyyy (example 31-01-2022")
+        args = parser.parse_args(sys.argv[2:])
+        index_type = args.index_type
+        
+        asyncio.run(self.fetch_historical_data(self.HISTORICAL_DATA_URL, index_type, args.from_date, args.to_date))
+        hr_df = pd.json_normalize(self.historical_data, record_path=['data', 'indexCloseOnlineRecords'])
+        if hr_df.empty:
+            print("No data found for the given date range")
+            exit(0)
+        hr_df['EOD_TIMESTAMP'] = pd.to_datetime(hr_df['EOD_TIMESTAMP'])
+        hr_df = hr_df.sort_values(by='EOD_TIMESTAMP')
+        start_date = max (args.from_date, hr_df.loc[1, ["EOD_TIMESTAMP"]].values[0]) # start date should be the first available date in the data but since we need for one previous day as well we take second entry
+        if start_date != args.from_date:
+            print(f"Start date is adjusted to the first available date {start_date.strftime('%d-%m-%Y')}")
+        self.calculate_historical_returns(hr_df, args.frequency, start_date, args.to_date)
+        
+    def calculate_historical_returns(self, data, frequency='Yearly', start_date=None, end_date=None):
+        results = []
+        if frequency == 'Yearly':
+            while start_date <= end_date:
+                end_cur_date = min (end_date,  datetime.datetime(start_date.year, 12, 31, 0, 0, 0))
+                results.append([start_date.year, self.calculate_returns(data, start_date, end_cur_date)])
+                start_date = end_cur_date + datetime.timedelta(days=1)
+            print(tabulate(results, headers=['Year', 'Change %', ], tablefmt='pretty', showindex=False))
+            
+        elif frequency == 'Monthly':
+            while start_date <= end_date:
+                end_cur_date = min (end_date,  pd.to_datetime(start_date).to_period('M').end_time)
+                results.append([start_date.year, start_date.strftime("%b"), self.calculate_returns(data, start_date, end_cur_date)])
+                start_date = end_cur_date + datetime.timedelta(days=1)
+            print(tabulate(results, headers=['Year', 'Month', 'Change %', ], tablefmt='pretty', showindex=False))
+        else:
+            pass
+        
+    def calculate_returns(self, data, start_date, end_date):
+        cur_date = start_date + datetime.timedelta(days=-1)
+        cur_price_data = data[data['EOD_TIMESTAMP'] == cur_date]
+        if cur_price_data.empty:
+            cur_price_data = data.iloc[data['EOD_TIMESTAMP'].searchsorted(cur_date) - 1]
+            cur_price = cur_price_data['EOD_CLOSE_INDEX_VAL']
+        else:
+            cur_price = cur_price_data['EOD_CLOSE_INDEX_VAL'].values[0]
+        
+        end_price_data = data[data['EOD_TIMESTAMP'] == end_date]
+        if end_price_data.empty:
+            end_price_data = data.iloc[data['EOD_TIMESTAMP'].searchsorted(end_date) - 1]
+            end_price = end_price_data['EOD_CLOSE_INDEX_VAL']
+        else:
+            end_price = end_price_data['EOD_CLOSE_INDEX_VAL'].values[0]
+        
+        return "{:.2f}".format(((end_price - cur_price) / cur_price) * 100)
+    
+    async def fetch_historical_data(self, url, index_type, start_date, end_date):
+        tasks = []
+        # Iterate through each year in the date range
+        current_date = start_date + datetime.timedelta(days=-7)
+        while current_date <= end_date:
+
+            # Calculate the appropriate end date for this iteration
+            end_date_for_iteration = min(current_date + datetime.timedelta(days=365), end_date)  # Ensure end date doesn't exceed overall end_date
+
+            # Construct URL with start date and calculated end date
+            start_date_str, end_date_str = self.format_hr_dates(current_date, end_date_for_iteration)
+            
+            # Create a task for each year's data fetch
+            task = asyncio.create_task(self.async_requester(url, params={'indexType': index_type, 'from': start_date_str, 'to': end_date_str}))
+            tasks.append(task)
+
+            # Move to the next year
+            current_date = end_date_for_iteration + datetime.timedelta(days=1)
+            
+        # Wait for all tasks to complete
+        self.historical_data = await asyncio.gather(*tasks)
+            
+    def format_hr_dates(self, from_date, to_date):
+        from_date = from_date.strftime('%d-%m-%Y')
+        to_date = to_date.strftime('%d-%m-%Y')
+        return from_date, to_date
+        
     @property
     def get_nifty_index(self):
         return self.NIFTY_INDEX
@@ -226,26 +366,45 @@ class MarketAnalysis():
         data = self.requester(self.API_URL)
 
     def requester(self, url, params=None):
-        with requests.session() as s:
-            # load cookies:
-            s.get(self.COOKIE_URL, headers=self.headers)
-
-            # get data:
-            data = s.get(url, params=params, headers=self.headers).json()
-            # print(json.dumps(data, indent=4))
-            return data
-            # print data to screen:
+        if self.nse_session is None:
+            self.initiate_nse_session()
+        try:
+            data = self.nse_session.get(url, params=params, headers=self.headers).json()
+        except requests.exceptions.RequestException as e:
+            self.nse_session.close()  # close the session
+            self.initiate_nse_session()
+            data = self.nse_session.get(url, params=params, headers=self.headers).json()
+        
+        #print(json.dumps(data, indent=4))
+        return data
 
     async def async_requester(self, url, params=None):
-        async with ClientSession() as s:
-            # load cookies:
-            await s.get(self.COOKIE_URL, headers=self.headers)
-
-            # get data:
-            data = await s.get(url, params=params, headers=self.headers)
-            # print(json.dumps(data, indent=4))
-            return data.json()
-            # print data to screen:
+        if self.nse_session is None:
+            self.initiate_nse_session()
+        try:
+            data = self.nse_session.get(url, params=params, headers=self.headers).json()
+        except requests.exceptions.RequestException as e:
+            self.nse_session.close()  # close the session
+            self.initiate_nse_session()
+            data = self.nse_session.get(url, params=params, headers=self.headers).json()
+        
+        #print(json.dumps(data, indent=4))
+        return data
+        # if self.nse_client_session is None:
+        #     print("chandra")
+        #     self.nse_client_session = ClientSession()
+        #     await self.nse_client_session.get(self.COOKIE_URL, headers=self.headers)
+        #     print("end")
+        # try:
+        #     print(params)
+        #     data = await self.nse_client_session.get(url, params=params, headers=self.headers)
+        # except httpcore.ConnectError as e:
+        #     self.nse_client_session.close()
+        #     self.nse_client_session = ClientSession()
+        #     data = await self.nse_client_session.get(url, params=params,headers=self.headers)
+                
+        # print(json.dumps(data, indent=4))
+        # return data.json()
 
     def get_atm_price(self):
         nifty_json = self.nse.get_index_quote(self.NIFTY_INDEX)
@@ -323,8 +482,8 @@ class MarketAnalysis():
                        headers=['pe-strikePrice', 'OI', 'Change in OI', ],
                        tablefmt='pretty', showindex=False))
 
-    def get_req_data(self, url):
-        data = self.requester(url)
+    def get_req_data(self, url, params=None):
+        data = self.requester(url, params=params)
         return data
 
     def get_expiry_data(self):
@@ -670,7 +829,7 @@ class MarketAnalysis():
 
     def get_period_details(self, data):
         dates = data['records']['expiryDates']
-        self.near_expiry = datetime.strptime(dates[0], self.EXPIRY_DATE_FORMAT)
+        self.near_expiry = datetime.datetime.strptime(dates[0], self.EXPIRY_DATE_FORMAT)
         near_date = self.near_expiry.date()
         near_month = near_date.month
         near_month_year = near_date.year
@@ -691,7 +850,7 @@ class MarketAnalysis():
     def get_expiry_dates(self, dates, month, year):
         prev_date = dates[0]
         for expiry_date in dates:
-            expiry_date_obj = datetime.strptime(expiry_date, self.EXPIRY_DATE_FORMAT).date()
+            expiry_date_obj = datetime.datetime.strptime(expiry_date, self.EXPIRY_DATE_FORMAT).date()
             if expiry_date_obj.month <= month and expiry_date_obj.year <= year:
                 prev_date = expiry_date
             else:
